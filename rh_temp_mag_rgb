@@ -1,0 +1,179 @@
+#include <Arduino_HS300x.h>
+#include <Arduino_APDS9960.h>
+#include <Arduino_BMI270_BMM150.h>
+#include <math.h>
+
+
+#define TEMP_EVENT_THRESHOLD      1.0 
+#define HUM_EVENT_THRESHOLD       4.0
+#define MAG_EVENT_THRESHOLD       15.0
+#define LIGHT_EVENT_THRESHOLD     60
+#define COLOR_RATIO_THRESHOLD     0.20
+
+
+float baseTemp = 0.0;
+float baseHum = 0.0;
+float baseMag = 0.0;
+
+int baseR = 0, baseG = 0, baseB = 0, baseC = 0;
+
+
+float readMagMagnitude() {
+  float x, y, z;
+  if (IMU.magneticFieldAvailable()) {
+    IMU.readMagneticField(x, y, z);
+    return sqrt(x * x + y * y + z * z);
+  }
+  return -1.0;
+}
+
+
+void captureBaseline() {
+  const int N = 10;
+
+  float tempSum = 0.0;
+  float humSum = 0.0;
+  float magSum = 0.0;
+  long rSum = 0, gSum = 0, bSum = 0, cSum = 0;
+
+  int validMag = 0;
+  int validColor = 0;
+
+  for (int i = 0; i < N; i++) {
+    if (HS300x.available()) {
+      tempSum += HS300x.readTemperature();
+      humSum += HS300x.readHumidity();
+    }
+
+    float mag = readMagMagnitude();
+    if (mag >= 0) {
+      magSum += mag;
+      validMag++;
+    }
+
+    if (APDS.colorAvailable()) {
+      int r, g, b, c;
+      APDS.readColor(r, g, b, c);
+      rSum += r;
+      gSum += g;
+      bSum += b;
+      cSum += c;
+      validColor++;
+    }
+
+    delay(100);
+  }
+
+  baseTemp = tempSum / N;
+  baseHum = humSum / N;
+  baseMag = (validMag > 0) ? (magSum / validMag) : 0.0;
+
+  if (validColor > 0) {
+    baseR = rSum / validColor;
+    baseG = gSum / validColor;
+    baseB = bSum / validColor;
+    baseC = cSum / validColor;
+  }
+
+  Serial.println("Baseline captured.");
+  Serial.print("Temp baseline: "); Serial.println(baseTemp);
+  Serial.print("Hum baseline: "); Serial.println(baseHum);
+  Serial.print("Mag baseline: "); Serial.println(baseMag);
+  Serial.print("Color baseline (R,G,B,C): ");
+  Serial.print(baseR); Serial.print(",");
+  Serial.print(baseG); Serial.print(",");
+  Serial.print(baseB); Serial.print(",");
+  Serial.println(baseC);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  if (!HS300x.begin()) {
+    Serial.println("Failed to initialize HS3003.");
+    while (1);
+  }
+
+  if (!APDS.begin()) {
+    Serial.println("Failed to initialize APDS9960.");
+    while (1);
+  }
+
+  if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU / magnetometer.");
+    while (1);
+  }
+
+  delay(1000);
+  captureBaseline();
+}
+
+
+void loop() {
+  float temp = HS300x.readTemperature();
+  float rh = HS300x.readHumidity();
+
+  float mx, my, mz;
+  float mag = 0;
+  if (IMU.magneticFieldAvailable()) {
+    IMU.readMagneticField(mx, my, mz);
+    mag = sqrt(mx*mx + my*my + mz*mz);
+  }
+
+  int r=0, g=0, b=0, c=0;
+  if (APDS.colorAvailable()) {
+    APDS.readColor(r, g, b, c);
+  }
+
+  float tempDiff = temp - baseTemp;
+  float rhDiff = rh - baseRH;
+  float magDiff = fabs(mag - baseMag);
+  int clearDiff = abs(c - baseClear);
+
+  float currSum = max(1, r + g + b);
+  float baseSum = max(1, baseR + baseG + baseB);
+
+  float colorShift =
+    fabs((float)r/currSum - (float)baseR/baseSum) +
+    fabs((float)g/currSum - (float)baseG/baseSum) +
+    fabs((float)b/currSum - (float)baseB/baseSum);
+
+  int humid_jump = (rhDiff >= HUM_EVENT_THRESHOLD);
+  int temp_rise = (tempDiff >= TEMP_EVENT_THRESHOLD);
+  int mag_shift = (magDiff >= MAG_EVENT_THRESHOLD);
+  int light_or_color_change =
+      (clearDiff >= LIGHT_EVENT_THRESHOLD) ||
+      (colorShift >= COLOR_RATIO_THRESHOLD);
+
+  const char* label;
+
+  if (mag_shift) {
+    label = "MAGNETIC_DISTURBANCE_EVENT";
+  } else if (humid_jump || temp_rise) {
+    label = "BREATH_OR_WARM_AIR_EVENT";
+  } else if (light_or_color_change) {
+    label = "LIGHT_OR_COLOR_CHANGE_EVENT";
+  } else {
+    label = "BASELINE_NORMAL";
+  }
+
+
+  Serial.print("raw,rh="); Serial.print(rh);
+  Serial.print(",temp="); Serial.print(temp);
+  Serial.print(",mag="); Serial.print(mag);
+  Serial.print(",r="); Serial.print(r);
+  Serial.print(",g="); Serial.print(g);
+  Serial.print(",b="); Serial.print(b);
+  Serial.print(",clear="); Serial.println(c);
+
+  Serial.print("flags,humid_jump="); Serial.print(humid_jump);
+  Serial.print(",temp_rise="); Serial.print(temp_rise);
+  Serial.print(",mag_shift="); Serial.print(mag_shift);
+  Serial.print(",light_or_color_change="); Serial.println(light_or_color_change);
+
+  Serial.print("event,");
+  Serial.println(label);
+
+  delay(500);
+}
