@@ -1,0 +1,198 @@
+#include <PDM.h>
+#include <Arduino_APDS9960.h>
+#include<Arduino_BMI270_BMM150.h>
+#include <math.h>
+
+
+#define PROXIMITY_THRESHOLD 120
+#define SOUND_THRESHOLD 500
+#define LIGHT_THRESHOLD 80
+#define MOTION_THRESHOLD 0.15
+
+
+SemaphoreHandle_t xMutex;
+TaskHandle_t thSound = NULL;
+TaskHandle_t thLight = NULL;
+TaskHandle_t thMotion = NULL;
+TaskHandle_t thProximity = NULL;
+TaskHandle_t thReadStates = NULL;
+
+
+short sampleBuffer[256];
+volatile int samplesRead = 0;
+volatile bool noisy = false;
+volatile bool bright = false;
+volatile bool move = false;
+volatile bool far = false;
+
+
+
+void onPDMdata() {
+  int bytesAvailable = PDM.available();
+  PDM.read(sampleBuffer, bytesAvailable);
+  samplesRead = bytesAvailable / 2;
+}
+
+//------------------------------------------------------------------------------
+// Task: Motion detection
+//------------------------------------------------------------------------------
+void Task_DetectSound(void *pv) {
+  while (1) {
+    int level = 0;
+
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      if (samplesRead) {
+        long sum = 0;
+        for (int i = 0; i < samplesRead; i++) {
+          sum += abs(sampleBuffer[i]);
+        }
+        level = sum / samplesRead;
+        samplesRead = 0;
+      }
+      xSemaphoreGive(xMutex);
+    }
+
+    noisy = level >= SOUND_THRESHOLD;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+//------------------------------------------------------------------------------
+// Task: Light detection
+//------------------------------------------------------------------------------
+void Task_DetectLight(void *pv) {
+  int r, g, b, c = 0;
+  while (1) {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      if (APDS.colorAvailable()) {
+        APDS.readColor(r, g, b, c);
+      }
+      xSemaphoreGive(xMutex);
+    }
+    bright = c >= LIGHT_THRESHOLD;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+//------------------------------------------------------------------------------
+// Task: Motion detection
+//------------------------------------------------------------------------------
+void Task_DetectMotion(void *pv) {
+  float x, y, z;
+  float prevAccelerator = 1.0;
+  while (1) {
+    float currAccelerator = prevAccelerator;
+
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      if (IMU.accelerationAvailable()) {
+        IMU.readAcceleration(x, y, z);
+        currAccelerator = sqrt(x * x + y * y + z * z);
+      }
+      xSemaphoreGive(xMutex);
+    }
+    
+    move = fabs(currAccelerator - prevAccelerator) >= MOTION_THRESHOLD;
+    prevAccelerator = currAccelerator;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+//------------------------------------------------------------------------------
+// Task: Proximity detection
+//------------------------------------------------------------------------------
+void Task_DetectProximity(void *pv) {
+  int proximity = 0;
+
+  while (1) {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      if (APDS.proximityAvailable()) {
+        proximity = APDS.readProximity();
+      }
+      xSemaphoreGive(xMutex);
+    }
+
+    far = proximity < PROXIMITY_THRESHOLD;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+//------------------------------------------------------------------------------
+// Task: Print states
+//------------------------------------------------------------------------------
+void Task_ReadStates(void *pv) {
+  while (1) {
+    int state = (noisy << 3) | (bright << 2) | (move << 1) | far;
+
+    switch (state) {
+      case 0b0000:
+        Serial.println("QUIET_DARK_STEADY_NEAR");
+        break;
+      
+      case 0b0101:
+        Serial.println("QUIET_BRIGHT_STEADY_FAR");
+        break;
+
+      case 0b1101:
+        Serial.println("NOISY_BRIGHT_STEADY_FAR");
+        break;
+
+      case 0b1110:
+        Serial.println("NOISY_BRIGHT_MOVING_NEAR");
+        break;
+      
+      default :
+        if (!far) {
+          if (move && noisy && bright) {
+            Serial.println("NOISY_BRIGHT_MOVING_NEAR");
+          } else {
+            Serial.println("QUIET_DARK_STEADY_NEAR");
+          }
+        } else {
+          if (noisy) {
+            Serial.println("NOISY_BRIGHT_STEADY_FAR");
+          } else {
+            Serial.println("QUIET_BRIGHT_STEADY_FAR");
+          }
+        }
+        break;
+      }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  // Setup microphone
+  PDM.onReceive(onPDMdata);
+  if (!PDM.begin(1, 16000)) {
+    Serial.println("Failed to start PDM microphone");
+    while(1);
+  }
+
+  // Setup APDS
+  if (!APDS.begin()) {
+    Serial.println("Failed to initialize APDS9960 sensor.");
+    while (1);
+  }
+
+  // Setup IMU
+  if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU."); 
+    while (1);
+  }
+
+  // Setup tasks
+  xMutex = xSemaphoreCreateMutex();
+  xSemaphoreGive(xMutex);
+  xTaskCreate(Task_DetectSound,        "SoundDetect", 4096, NULL, 1, &thSound);
+  xTaskCreate(Task_DetectLight,        "LightDetect", 4096, NULL, 1, &thLight);
+  xTaskCreate(Task_DetectMotion,       "MotionDetect",  4096, NULL, 1, &thMotion);
+  xTaskCreate(Task_DetectProximity,    "ProximityDetect", 4096, NULL, 1, &thProximity);
+  xTaskCreate(Task_ReadStates,       "ReadStates",  4096, NULL, 1, &thReadStates);
+}
+
+void loop() {
+  // FreeRTOS
+}
